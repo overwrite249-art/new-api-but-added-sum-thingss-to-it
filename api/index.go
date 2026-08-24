@@ -18,17 +18,17 @@
 //
 // BUILD NOTE
 // ----------
-// Vercel's Go runtime requires each entrypoint to be `package main` exposing an
-// exported http.HandlerFunc, and it injects the actual func main() at build
-// time. Consequently `go build ./...` and `go vet ./...` will report
-// "function main is undeclared in the main package" for ./api/... . That is
-// expected. Exclude ./api/... from local builds and CI, e.g.:
+// Vercel's Go runtime discovers each file under /api that exports an
+// http.HandlerFunc and generates the func main() wrapper for it at build time.
+// The generated wrapper IMPORTS this package, so this file must be a normal
+// library package -- `package handler`, not `package main`.
 //
-//	go build $(go list ./... | grep -v '/api')
+// Because it is a library package, `go build ./...` and `go vet ./...` work
+// across the whole module with no exclusions required.
 //
 // The non-Vercel entrypoint (main.go at the repo root) is untouched, so Docker
 // and bare-metal builds are unaffected.
-package main
+package handler
 
 import (
 	"fmt"
