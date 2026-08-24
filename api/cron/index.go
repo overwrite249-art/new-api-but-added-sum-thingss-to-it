@@ -1,9 +1,17 @@
 // Vercel Cron entrypoint: performs the periodic work that main.go runs in
 // background goroutines.
 //
-// Each invocation does ONE pass of ONE job and returns. The job is selected by
-// the ?job= query parameter so a single deployed function can serve every
-// schedule in vercel.json.
+// Each invocation runs one pass of each requested job and returns. Jobs are
+// selected with the ?job= query parameter; when it is omitted, every job runs
+// in sequence.
+//
+// WHY ALL JOBS BY DEFAULT
+// -----------------------
+// Vercel's Hobby plan permits only one cron invocation per day per expression
+// ("Hobby accounts are limited to daily cron jobs" is a hard deploy-time
+// rejection), and scheduled invocations are plain GETs against the configured
+// path with no query string. A single daily hit of /api/cron therefore has to
+// cover every job. ?job= is retained for targeted manual runs.
 //
 // SECURITY
 // --------
@@ -18,11 +26,13 @@
 // endpoint that can be used as an amplification vector against upstream
 // providers.
 //
-// BUILD NOTE: see the build note in api/index.go -- `go build ./...` will
-// complain about ./api/... because Vercel injects func main() at build time.
-package main
+// BUILD NOTE: see the build note in api/index.go -- this must be a library
+// package (`package handler`) because Vercel generates and imports a func
+// main() wrapper at build time.
+package handler
 
 import (
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -31,15 +41,19 @@ import (
 	"strings"
 	"time"
 
-	"github.com/QuantumNous/new-api/service"
 	"github.com/QuantumNous/new-api/serverless"
+	"github.com/QuantumNous/new-api/service"
 )
 
+// allJobs is the execution order used when no ?job= is supplied.
+var allJobs = []string{"system-tasks", "subscriptions", "codex-credentials"}
+
 type cronResponse struct {
-	Success    bool   `json:"success"`
-	Job        string `json:"job"`
-	DurationMs int64  `json:"duration_ms"`
-	Message    string `json:"message,omitempty"`
+	Success    bool     `json:"success"`
+	Requested  []string `json:"requested,omitempty"`
+	Completed  []string `json:"completed,omitempty"`
+	DurationMs int64    `json:"duration_ms"`
+	Message    string   `json:"message,omitempty"`
 }
 
 // Handler is the Vercel Function entrypoint for scheduled jobs.
@@ -55,13 +69,25 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	job := strings.TrimSpace(r.URL.Query().Get("job"))
-	if job == "" {
-		writeJSON(w, http.StatusBadRequest, cronResponse{
-			Success: false,
-			Message: "missing ?job= (expected one of: system-tasks, subscriptions, codex-credentials)",
-		})
-		return
+	jobs := allJobs
+	if requested := strings.TrimSpace(r.URL.Query().Get("job")); requested != "" {
+		jobs = []string{requested}
+	}
+
+	// Validate before initialising anything: a typo should cost a 400, not a
+	// database cold start.
+	for _, job := range jobs {
+		if !knownJob(job) {
+			writeJSON(w, http.StatusBadRequest, cronResponse{
+				Success:   false,
+				Requested: jobs,
+				Message: fmt.Sprintf(
+					"unknown job %q (expected one of: %s)",
+					job, strings.Join(allJobs, ", "),
+				),
+			})
+			return
+		}
 	}
 
 	// Cron runs need a database, loaded options and registered task handlers,
@@ -69,9 +95,9 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	// this cold start cheaper than an API cold start.
 	if err := serverless.EnsureResources(); err != nil {
 		writeJSON(w, http.StatusInternalServerError, cronResponse{
-			Success: false,
-			Job:     job,
-			Message: "initialization failed: " + err.Error(),
+			Success:   false,
+			Requested: jobs,
+			Message:   "initialization failed: " + err.Error(),
 		})
 		return
 	}
@@ -81,36 +107,60 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	// stop cleanly instead of being hard-killed holding a task lease.
 	ctx := r.Context()
 	start := time.Now()
+	completed := make([]string, 0, len(jobs))
 
-	switch job {
-	case "system-tasks":
-		// Covers all four scheduled handlers registered by
-		// controller.RegisterScheduledSystemTasks: channel test, upstream model
-		// update, Midjourney polling and async (Suno/video) task polling.
-		// Each handler's own Enabled() decides whether it is due, so this single
-		// schedule is enough for all of them.
-		service.RunSystemTaskPassOnce(ctx, "")
+	for _, job := range jobs {
+		// Several jobs in one invocation share a single timeout budget, so stop
+		// at a cancelled context rather than starting work that cannot finish.
+		if ctx.Err() != nil {
+			writeJSON(w, http.StatusOK, cronResponse{
+				Success:    false,
+				Requested:  jobs,
+				Completed:  completed,
+				DurationMs: time.Since(start).Milliseconds(),
+				Message:    "stopped early: " + ctx.Err().Error(),
+			})
+			return
+		}
 
-	case "subscriptions":
-		service.RunSubscriptionMaintenanceOnce()
-
-	case "codex-credentials":
-		service.RunCodexCredentialRefreshOnce()
-
-	default:
-		writeJSON(w, http.StatusBadRequest, cronResponse{
-			Success: false,
-			Job:     job,
-			Message: fmt.Sprintf("unknown job %q", job),
-		})
-		return
+		runJob(ctx, job)
+		completed = append(completed, job)
 	}
 
 	writeJSON(w, http.StatusOK, cronResponse{
 		Success:    true,
-		Job:        job,
+		Requested:  jobs,
+		Completed:  completed,
 		DurationMs: time.Since(start).Milliseconds(),
 	})
+}
+
+func knownJob(job string) bool {
+	for _, candidate := range allJobs {
+		if candidate == job {
+			return true
+		}
+	}
+	return false
+}
+
+// runJob performs exactly one pass of one job. Each underlying function is
+// already guarded against overlapping runs (atomic bools upstream, plus the
+// database task lease for system tasks), so a slow invocation that overlaps the
+// next schedule is safe.
+func runJob(ctx context.Context, job string) {
+	switch job {
+	case "system-tasks":
+		// Covers all four scheduled handlers registered by
+		// controller.RegisterScheduledSystemTasks: channel test, upstream model
+		// update, Midjourney polling and async (Suno/video) task polling. Each
+		// handler's own Enabled() decides whether it is due.
+		service.RunSystemTaskPassOnce(ctx, "")
+	case "subscriptions":
+		service.RunSubscriptionMaintenanceOnce()
+	case "codex-credentials":
+		service.RunCodexCredentialRefreshOnce()
+	}
 }
 
 // authorized fails closed: an unset CRON_SECRET denies every request rather
