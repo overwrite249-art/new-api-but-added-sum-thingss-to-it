@@ -1,0 +1,34 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "cd web && npm install && npm run build",
+  "outputDirectory": "web/dist",
+  "functions": {
+    "api/index.go": {
+      "memory": 1024,
+      "maxDuration": 300
+    },
+    "api/cron/index.go": {
+      "memory": 512,
+      "maxDuration": 300
+    }
+  },
+  "rewrites": [
+    { "source": "/v1/:path*", "destination": "/api/index" },
+    { "source": "/v1beta/:path*", "destination": "/api/index" },
+    { "source": "/pg/:path*", "destination": "/api/index" },
+    { "source": "/mj/:path*", "destination": "/api/index" },
+    { "source": "/suno/:path*", "destination": "/api/index" },
+    { "source": "/kling/:path*", "destination": "/api/index" },
+    { "source": "/jimeng", "destination": "/api/index" },
+    { "source": "/jimeng/:path*", "destination": "/api/index" },
+    { "source": "/dashboard/:path*", "destination": "/api/index" },
+    { "source": "/:mode/mj/:path*", "destination": "/api/index" },
+    { "source": "/api/:path*", "destination": "/api/index" },
+    { "source": "/:path*", "destination": "/index.html" }
+  ],
+  "crons": [
+    { "path": "/api/cron?job=system-tasks", "schedule": "* * * * *" },
+    { "path": "/api/cron?job=subscriptions", "schedule": "*/5 * * * *" },
+    { "path": "/api/cron?job=codex-credentials", "schedule": "*/10 * * * *" }
+  ]
+}
