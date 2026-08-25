@@ -127,6 +127,26 @@ func initResources() error {
 	})
 	kitutil.SetSystemErrorLogging(common.SysError)
 
+	// MUST happen before InitEnv(). common.LogDir is a flag whose default is
+	// "./logs" -- a flag, not an environment variable, so no amount of platform
+	// configuration can change it. InitEnv() resolves it with filepath.Abs and
+	// then os.Mkdir()s it, calling log.Fatal(err) on failure. A function bundle
+	// is mounted read-only at /var/task, so leaving this alone means every cold
+	// start dies with
+	//
+	//	mkdir /var/task/logs: read-only file system
+	//
+	// and log.Fatal's os.Exit(1) kills the process before any handler can
+	// respond -- the caller sees an opaque FUNCTION_INVOCATION_FAILED with no
+	// body instead of the JSON error this package tries hard to return.
+	//
+	// Clearing it disables file logging, which is the right behaviour here: the
+	// platform already collects stdout/stderr, and a log file on an ephemeral
+	// per-instance disk could never be read back. logger.SetupLogger() skips
+	// file setup when LogDir is empty, and controller.getLogFiles() returns no
+	// files rather than erroring, so the admin log viewer degrades cleanly.
+	*common.LogDir = ""
+
 	// Note: no godotenv.Load here. A function runtime injects configuration as
 	// real environment variables and the deployment bundle has no .env file.
 	common.InitEnv()
