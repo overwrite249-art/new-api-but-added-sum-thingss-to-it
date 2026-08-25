@@ -1,9 +1,10 @@
 // Vercel Cron entrypoint: performs the periodic work that main.go runs in
-// background goroutines.
+// background goroutines, plus the one-off schema migration that main.go runs
+// while booting a master node.
 //
 // Each invocation runs one pass of each requested job and returns. Jobs are
-// selected with the ?job= query parameter; when it is omitted, every job runs
-// in sequence.
+// selected with the ?job= query parameter; when it is omitted, every scheduled
+// job runs in sequence.
 //
 // WHY ALL JOBS BY DEFAULT
 // -----------------------
@@ -13,13 +14,21 @@
 // path with no query string. A single daily hit of /api/cron therefore has to
 // cover every job. ?job= is retained for targeted manual runs.
 //
+// THE MIGRATE JOB
+// ---------------
+// ?job=migrate creates or updates the database schema. It is excluded from the
+// scheduled run -- DDL should not be re-applied daily -- and is reachable only
+// by asking for it by name. Run it once before first use and again after an
+// upgrade that changes the schema.
+//
 // SECURITY
 // --------
 // This endpoint triggers expensive work (testing every channel, refreshing
-// OAuth credentials, scanning subscriptions), so it must not be publicly
-// callable. Set a CRON_SECRET environment variable; Vercel then sends it as
-// `Authorization: Bearer <CRON_SECRET>` on scheduled invocations, and this
-// handler rejects anything else with 401 using a constant-time comparison.
+// OAuth credentials, scanning subscriptions, altering the schema), so it must
+// not be publicly callable. Set a CRON_SECRET environment variable; Vercel then
+// sends it as `Authorization: Bearer <CRON_SECRET>` on scheduled invocations,
+// and this handler rejects anything else with 401 using a constant-time
+// comparison.
 //
 // If CRON_SECRET is unset the handler refuses to run at all rather than
 // defaulting to open access. Failing closed is the right default for an
@@ -45,8 +54,20 @@ import (
 	"github.com/QuantumNous/new-api/service"
 )
 
+const (
+	jobSystemTasks      = "system-tasks"
+	jobSubscriptions    = "subscriptions"
+	jobCodexCredentials = "codex-credentials"
+	jobMigrate          = "migrate"
+)
+
 // allJobs is the execution order used when no ?job= is supplied.
-var allJobs = []string{"system-tasks", "subscriptions", "codex-credentials"}
+var allJobs = []string{jobSystemTasks, jobSubscriptions, jobCodexCredentials}
+
+// manualJobs are accepted via ?job= but deliberately kept out of the scheduled
+// run. Migration is DDL: it should happen when an operator asks for it, not
+// every night.
+var manualJobs = []string{jobMigrate}
 
 type cronResponse struct {
 	Success    bool     `json:"success"`
@@ -83,11 +104,42 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 				Requested: jobs,
 				Message: fmt.Sprintf(
 					"unknown job %q (expected one of: %s)",
-					job, strings.Join(allJobs, ", "),
+					job, strings.Join(knownJobNames(), ", "),
 				),
 			})
 			return
 		}
+	}
+
+	// Migration runs before, and instead of, full initialisation. On a database
+	// with no tables yet EnsureResources fails, because model.CheckSetup and
+	// model.InitOptionMap read rows that only exist once migration has run --
+	// so requiring initialisation first would make this endpoint unusable in
+	// exactly the situation it exists for.
+	if len(jobs) == 1 && jobs[0] == jobMigrate {
+		start := time.Now()
+
+		if err := serverless.Migrate(); err != nil {
+			// Reported as an error, unlike the fire-and-forget periodic jobs: a
+			// half-applied schema needs to be visible now, not discovered later
+			// as a confusing query failure.
+			writeJSON(w, http.StatusInternalServerError, cronResponse{
+				Success:    false,
+				Requested:  jobs,
+				DurationMs: time.Since(start).Milliseconds(),
+				Message:    "migration failed: " + err.Error(),
+			})
+			return
+		}
+
+		writeJSON(w, http.StatusOK, cronResponse{
+			Success:    true,
+			Requested:  jobs,
+			Completed:  jobs,
+			DurationMs: time.Since(start).Milliseconds(),
+			Message:    "schema is up to date; open /setup to create the first admin account",
+		})
+		return
 	}
 
 	// Cron runs need a database, loaded options and registered task handlers,
@@ -135,8 +187,16 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// knownJobNames lists every accepted ?job= value, scheduled and manual alike.
+func knownJobNames() []string {
+	names := make([]string, 0, len(allJobs)+len(manualJobs))
+	names = append(names, allJobs...)
+	names = append(names, manualJobs...)
+	return names
+}
+
 func knownJob(job string) bool {
-	for _, candidate := range allJobs {
+	for _, candidate := range knownJobNames() {
 		if candidate == job {
 			return true
 		}
@@ -144,21 +204,24 @@ func knownJob(job string) bool {
 	return false
 }
 
-// runJob performs exactly one pass of one job. Each underlying function is
-// already guarded against overlapping runs (atomic bools upstream, plus the
-// database task lease for system tasks), so a slow invocation that overlaps the
-// next schedule is safe.
+// runJob performs exactly one pass of one scheduled job. Each underlying
+// function is already guarded against overlapping runs (atomic bools upstream,
+// plus the database task lease for system tasks), so a slow invocation that
+// overlaps the next schedule is safe.
+//
+// jobMigrate is not handled here: it is dispatched earlier, before
+// initialisation, and needs to surface its error.
 func runJob(ctx context.Context, job string) {
 	switch job {
-	case "system-tasks":
+	case jobSystemTasks:
 		// Covers all four scheduled handlers registered by
 		// controller.RegisterScheduledSystemTasks: channel test, upstream model
 		// update, Midjourney polling and async (Suno/video) task polling. Each
 		// handler's own Enabled() decides whether it is due.
 		service.RunSystemTaskPassOnce(ctx, "")
-	case "subscriptions":
+	case jobSubscriptions:
 		service.RunSubscriptionMaintenanceOnce()
-	case "codex-credentials":
+	case jobCodexCredentials:
 		service.RunCodexCredentialRefreshOnce()
 	}
 }
