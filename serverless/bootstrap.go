@@ -43,9 +43,15 @@
 //          WebAssets without tripping common.EmbedFolder.
 //   - FRONTEND_BASE_URL is derived from the platform's own hostname when unset.
 //     An explicit value always wins, which matters behind a custom domain.
+//   - SESSION_COOKIE_SECURE defaults to true here, unlike upstream, because a
+//     function platform terminates TLS for us and there is no plaintext
+//     deployment to stay compatible with. It is not merely a cookie attribute:
+//     middleware.SessionCookieOriginGuard disables ITSELF when the flag is off,
+//     which removes the only CSRF defence on the cookie-authenticated auth
+//     endpoints. See applySessionCookieDefaults.
 //
-// SQL_DSN is the one setting that cannot be guessed; see
-// validateServerlessConfig for why the SQLite fallback cannot work here.
+// SQL_DSN and SESSION_SECRET are the two settings that cannot be guessed; see
+// validateServerlessConfig for why neither has a usable fallback here.
 //
 // DATABASE MIGRATIONS
 // -------------------
@@ -62,6 +68,7 @@ package serverless
 import (
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -216,7 +223,8 @@ func initEnvOnce() {
 	*common.LogDir = ""
 
 	// Also MUST happen before InitEnv(), which is where common.IsMasterNode is
-	// derived from NODE_TYPE.
+	// derived from NODE_TYPE and where InitSessionCookieSettings() reads the
+	// SESSION_COOKIE_* variables.
 	applyServerlessDefaults()
 
 	// Note: no godotenv.Load here. A function runtime injects configuration as
@@ -329,7 +337,8 @@ func initResources() error {
 // applyServerlessDefaults fills in configuration that this runtime can work out
 // for itself. Anything set explicitly by the operator wins.
 //
-// Caller must invoke this BEFORE common.InitEnv(), which reads NODE_TYPE.
+// Caller must invoke this BEFORE common.InitEnv(), which reads NODE_TYPE and
+// the SESSION_COOKIE_* variables.
 func applyServerlessDefaults() {
 	// Not "default to slave" -- FORCE slave. A master node here is always a
 	// misconfiguration: it would start daemon goroutines that the platform
@@ -338,6 +347,16 @@ func applyServerlessDefaults() {
 	// package comment.
 	_ = os.Setenv("NODE_TYPE", "slave")
 
+	applyFrontendBaseURLDefault()
+
+	// Ordered after the frontend default on purpose: it reuses the resolved
+	// FRONTEND_BASE_URL as the trusted cookie origin.
+	applySessionCookieDefaults()
+}
+
+// applyFrontendBaseURLDefault derives the site URL from the platform when the
+// operator has not supplied one.
+func applyFrontendBaseURLDefault() {
 	if strings.TrimSpace(os.Getenv("FRONTEND_BASE_URL")) != "" {
 		return
 	}
@@ -354,6 +373,83 @@ func applyServerlessDefaults() {
 			return
 		}
 	}
+}
+
+// applySessionCookieDefaults turns on secure session cookies, which upstream
+// leaves off.
+//
+// The default matters for more than the cookie's Secure attribute.
+// middleware.SessionCookieOriginGuard short-circuits with c.Next() when
+// common.SessionCookieSecure is false, so with the upstream default the
+// Origin/Referer check on the cookie-authenticated /api/user/auth/refresh and
+// /api/user/auth/logout endpoints does not run at all. Upstream defaults to off
+// for local http development; a function platform terminates TLS for us and has
+// no plaintext mode, so that trade-off does not apply.
+//
+// Enabling it requires a trusted origin in the SAME pass: with
+// SESSION_COOKIE_SECURE=true and SESSION_COOKIE_TRUSTED_URL empty,
+// common.InitSessionCookieSettings() returns an error and common.InitEnv turns
+// that into log.Fatal -- another opaque FUNCTION_INVOCATION_FAILED with no
+// response body, exactly like the read-only LogDir crash. So the flag is only
+// set when an https origin is actually available to pair with it.
+func applySessionCookieDefaults() {
+	secure := strings.TrimSpace(os.Getenv("SESSION_COOKIE_SECURE"))
+
+	// An explicit opt-out is honoured. It is a legitimate choice when this
+	// deployment sits behind a proxy that terminates TLS somewhere else.
+	if strings.EqualFold(secure, "false") {
+		return
+	}
+
+	trusted := strings.TrimSpace(os.Getenv("SESSION_COOKIE_TRUSTED_URL"))
+	origin := httpsOriginOf(os.Getenv("FRONTEND_BASE_URL"))
+
+	if origin == "" && trusted == "" {
+		// Nothing to pair the flag with. Setting it anyway would abort the
+		// process instead of degrading, so leave upstream's default in place.
+		// Unreachable in practice: validateServerlessConfig already refuses to
+		// serve without a resolvable FRONTEND_BASE_URL.
+		if strings.EqualFold(secure, "true") {
+			common.SysError(
+				"serverless: SESSION_COOKIE_SECURE=true requires SESSION_COOKIE_TRUSTED_URL, " +
+					"and no https origin could be derived from FRONTEND_BASE_URL to supply one",
+			)
+		}
+		return
+	}
+
+	if trusted == "" {
+		_ = os.Setenv("SESSION_COOKIE_TRUSTED_URL", origin)
+		trusted = origin
+	}
+	if secure == "" {
+		_ = os.Setenv("SESSION_COOKIE_SECURE", "true")
+		common.SysLog(
+			"serverless: enabled SESSION_COOKIE_SECURE with trusted origin " + trusted +
+				" (also re-enables the auth-endpoint Origin check)",
+		)
+	}
+}
+
+// httpsOriginOf reduces a site URL to the scheme-and-host-only https origin
+// that common.NormalizeOrigin will accept, or "" if it cannot.
+//
+// Rejecting non-https is deliberate rather than defensive: NormalizeOrigin is
+// happy with http, but InitSessionCookieSettings then requires every trusted URL
+// to start with https://, so passing an http origin through would trade a
+// working insecure default for a fatal error.
+func httpsOriginOf(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+		return ""
+	}
+	// Drop any path/query an operator appended; NormalizeOrigin rejects those.
+	// Case and default ports are normalised there.
+	return "https://" + parsed.Host
 }
 
 // validateServerlessConfig fails fast, with an explanation, on configuration
@@ -390,6 +486,26 @@ func validateServerlessConfig() error {
 				"database and all data would be lost. Provision a hosted database, set SQL_DSN to " +
 				"its connection string, then create the schema by calling the cron endpoint with " +
 				"?job=migrate",
+		)
+	}
+	// Checked here rather than left to upstream's default because the default is
+	// process-scoped and this runtime has many processes. common.InitEnv only
+	// rejects the literal placeholder "random_string"; absent entirely, it is
+	// silently accepted.
+	if strings.TrimSpace(os.Getenv("SESSION_SECRET")) == "" {
+		return fmt.Errorf(
+			"serverless: SESSION_SECRET must be set to a long random string. Left unset, " +
+				"common.SessionSecret falls back to uuid.New().String(), which is evaluated once " +
+				"per PROCESS. A daemon has exactly one process, so upstream can treat that as " +
+				"'a restart signs everybody out'. A function runtime serves requests from many " +
+				"concurrent instances, each with its own value, and the resulting breakage is " +
+				"silent rather than loud: sessions and access tokens issued by one instance are " +
+				"rejected by the next, so users see intermittent logouts and login loops with no " +
+				"error logged anywhere. CRYPTO_SECRET also defaults to this value, and " +
+				"common.GenerateHMAC keys HMAC-SHA256 with it, so HMACs written by one instance " +
+				"do not verify on another. Set SESSION_SECRET to a fixed random string (and " +
+				"CRYPTO_SECRET too if you want them to differ). Note that the literal value " +
+				"'random_string' is rejected by common.InitEnv with log.Fatal",
 		)
 	}
 	return nil
