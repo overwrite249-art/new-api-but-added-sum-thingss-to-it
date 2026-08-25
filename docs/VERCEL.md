@@ -140,8 +140,14 @@ Strongly recommended, from `.env.vercel.example`:
   spike exhausts the database's connection limit.
 - **`BATCH_UPDATE_ENABLED=false`**, **`DATA_EXPORT_ENABLED=false`** — otherwise
   buffered billing/usage data is silently lost when an instance is discarded.
-- **`TRUSTED_PROXIES`** — requests always arrive via Vercel's edge, so without
-  this every client collapses into one rate-limit bucket.
+- **`REDIS_CONN_STRING`** — effectively required rather than a performance
+  option. Without Redis every rate limiter falls back to per-instance memory,
+  so limits are multiplied by the number of live instances and reset whenever
+  one is recycled.
+- **Leave `TRUSTED_PROXIES` unset.** The upstream default already trusts
+  loopback, RFC 1918 and IPv6 ULA, which covers the platform's internal hop.
+  Setting `0.0.0.0/0` is a client-IP spoofing hole, not a convenience — see
+  [Security notes](#security-notes).
 - **`SESSION_COOKIE_SECURE=true`** — deployments are always HTTPS.
 
 `NODE_TYPE` and `FRONTEND_BASE_URL` are **not** required. `applyServerlessDefaults`
@@ -349,18 +355,65 @@ Tightened while porting, because serverless changes the threat model:
   `FRONTEND_BASE_URL` *is* this origin, an unmatched `/api/...` path would
   redirect to itself forever. `serverless/bootstrap.go` re-registers `NoRoute`
   with a plain JSON 404.
-- **Rate limiting depends on `TRUSTED_PROXIES`.** Without it, IP-based limits
-  see only Vercel edge addresses and collapse into a single bucket.
-- **Rate limiting without Redis is per-instance**, so effective limits are
-  silently multiplied by the number of live instances. Redis is strongly
-  recommended, not merely a performance option.
 - **Never commit `SQL_DSN`.** `vercel.json` supports an `env` block, which is
   tempting and wrong: it lives in the repository. Set secrets in project
   settings.
 
-No claim is made that the codebase is free of vulnerabilities. These are
-deployment-model issues found while porting — **not** the result of a security
-audit of the ~78 files in `service/` or ~88 in `controller/`.
+### Do not set `TRUSTED_PROXIES=0.0.0.0/0`
+
+An earlier revision of this guide and of `.env.vercel.example` recommended
+exactly that, reasoning that requests always arrive through the platform's edge
+so the edge may as well be trusted. That reasoning is wrong, and the mistake is
+recorded here rather than quietly deleted.
+
+Gin resolves the client address by walking `X-Forwarded-For` from **right to
+left** and returning the first entry it does not trust. Its `validateHeader`
+loop terminates on `(i == 0) || !isTrustedProxy(ip)`, so when *every* address is
+trusted the walk runs out of untrusted hops and falls through to `items[0]` —
+the **leftmost** value, which is simply whatever the client sent. A request
+carrying
+
+```
+X-Forwarded-For: 1.2.3.4
+```
+
+therefore makes `c.ClientIP()` return `1.2.3.4`. Every control keyed on client
+IP becomes attacker-controlled:
+
+| Control | Consequence |
+|---|---|
+| Token IP allowlists (`token.GetIpLimits`, enforced in `TokenAuth` via `common.IsIpInCIDRList`) | Bypassed outright. This is an **access control**, not throttling. |
+| `GlobalWebRateLimit` / `GlobalAPIRateLimit` / `CriticalRateLimit`, upload and download limits | Bypassed by rotating the header value per request. |
+| `EmailVerificationRateLimit` (2 per 30s per IP) | Stops limiting, turning the verification endpoint into a mail bomber. |
+| Turnstile | Receives a forged `remoteip`, weakening its risk scoring. |
+| Audit logs | Record attacker-chosen addresses, so abuse cannot be traced. |
+
+**Leave the variable unset.** `defaultTrustedProxyCIDRs` already covers
+`127.0.0.0/8`, `::1`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16` and
+`fc00::/7`, which is enough for the platform's internal hop, because the
+function process is invoked from a local proxy rather than from the public
+internet. Widen it only for a proxy you run yourself, and then list that proxy's
+addresses explicitly.
+
+`TRUSTED_PROXIES=none` is the opposite error: Gin would ignore `X-Forwarded-For`
+altogether, every client would collapse into the internal address, and one
+user's traffic would exhaust everybody's rate limit.
+
+### Rate limiting does not work without Redis
+
+`rateLimitFactory` falls back to `inMemoryRateLimiter` whenever
+`common.RedisEnabled` is false, and that counter lives in the instance's own
+memory. Instances scale horizontally and are recycled freely, so the effective
+limit is `configured limit x live instances` and it resets on every recycle.
+`ModelRequestRateLimit` has the same fallback. Treat `REDIS_CONN_STRING` as
+required if you expose this deployment publicly.
+
+---
+
+These are deployment-model findings, plus what came out of a first pass over the
+auth and rate-limit middleware — see `docs/SECURITY-AUDIT.md`. **No claim is
+made that the codebase is free of vulnerabilities.** The ~78 files in `service/`
+and ~88 in `controller/`, and all of `relay/`, have not been reviewed.
 
 ---
 
