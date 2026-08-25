@@ -47,13 +47,16 @@
 // SQL_DSN is the one setting that cannot be guessed; see
 // validateServerlessConfig for why the SQLite fallback cannot work here.
 //
-// DATABASE MIGRATIONS ARE NOT RUN HERE
-// ------------------------------------
-// Slave nodes intentionally skip schema migration. Run migrations once against
-// the same database before the first serverless deploy (easiest: boot the
-// normal Docker image against that database, let it migrate, then shut it
-// down). Deploying this package against an unmigrated database will fail at
-// query time, not at boot.
+// DATABASE MIGRATIONS
+// -------------------
+// Migration is explicit here, never a side effect of boot. A master node
+// migrates inside model.InitDB() during startup; doing the same on a request
+// path would bill one unlucky user for thirty-odd AutoMigrate statements, and
+// two simultaneous cold starts would race on DDL.
+//
+// Call Migrate() instead -- once before first use, and again after an upgrade
+// that changes the schema. The cron endpoint exposes it as ?job=migrate, so no
+// Docker host or database client is required.
 package serverless
 
 import (
@@ -86,6 +89,7 @@ import (
 var (
 	initMu        sync.Mutex
 	engine        *gin.Engine
+	envDone       bool
 	resourcesDone bool
 )
 
@@ -125,11 +129,65 @@ func EnsureResources() error {
 	return initResources()
 }
 
-// initResources mirrors InitResources() in main.go, minus everything that only
-// makes sense in a long-lived process. Caller must hold initMu.
-func initResources() error {
-	if resourcesDone {
-		return nil
+// Migrate creates or updates the database schema, then returns. It replaces the
+// migration that main.go performs implicitly while booting a master node.
+//
+// Intentionally minimal, and intentionally NOT built on initResources: on a
+// fresh database model.CheckSetup() and model.InitOptionMap() read tables that
+// do not exist until this has run, so full initialisation cannot be a
+// precondition for migrating. This opens the database and nothing else.
+//
+// Safe to call against an already-migrated database; see model.RunMigrations.
+//
+// Caveat inherited from upstream: model.InitDB calls common.FatalLog when the
+// connection itself cannot be opened, which exits the process rather than
+// returning. A malformed SQL_DSN therefore surfaces as an opaque platform-level
+// invocation failure instead of the JSON error below. validateServerlessConfig
+// catches the common case of it being absent entirely.
+func Migrate() error {
+	initMu.Lock()
+	defer initMu.Unlock()
+
+	initEnvOnce()
+
+	if err := validateServerlessConfig(); err != nil {
+		return err
+	}
+
+	// Reuse the pool if a previous request on this warm instance already opened
+	// one. model.InitDB is not idempotent -- calling it twice would abandon the
+	// first *sql.DB along with its connections.
+	if model.DB == nil {
+		if err := model.InitDB(); err != nil {
+			return fmt.Errorf("failed to initialize database: %w", err)
+		}
+	}
+	if model.LOG_DB == nil {
+		if err := model.InitLogDB(); err != nil {
+			return fmt.Errorf("failed to initialize log database: %w", err)
+		}
+	}
+
+	if err := model.RunMigrations(); err != nil {
+		return fmt.Errorf("schema migration failed: %w", err)
+	}
+
+	common.SysLog("serverless: schema migration completed")
+	return nil
+}
+
+// initEnvOnce performs the process-wide environment setup that both the request
+// path and Migrate depend on. Caller must hold initMu.
+//
+// Split out of initResources so that Migrate can reuse it without pulling in
+// the database-dependent steps that a not-yet-migrated database cannot serve.
+//
+// Guarded by its own flag rather than folded into resourcesDone: common.InitEnv
+// calls flag.Parse() and contains several log.Fatal branches, so repeating it is
+// pointless at best and fatal at worst.
+func initEnvOnce() {
+	if envDone {
+		return
 	}
 
 	kitutil.SetLogging(common.SysLog, func(message string) {
@@ -166,6 +224,18 @@ func initResources() error {
 	common.InitEnv()
 	logger.SetupLogger()
 
+	envDone = true
+}
+
+// initResources mirrors InitResources() in main.go, minus everything that only
+// makes sense in a long-lived process. Caller must hold initMu.
+func initResources() error {
+	if resourcesDone {
+		return nil
+	}
+
+	initEnvOnce()
+
 	if err := validateServerlessConfig(); err != nil {
 		return err
 	}
@@ -174,8 +244,10 @@ func initResources() error {
 	service.InitHttpClient()
 	service.InitTokenEncoders()
 
-	if err := model.InitDB(); err != nil {
-		return fmt.Errorf("failed to initialize database: %w", err)
+	if model.DB == nil {
+		if err := model.InitDB(); err != nil {
+			return fmt.Errorf("failed to initialize database: %w", err)
+		}
 	}
 	if err := authz.Init(model.DB); err != nil {
 		return fmt.Errorf("failed to initialize authorization: %w", err)
@@ -184,8 +256,10 @@ func initResources() error {
 	model.CheckSetup()
 	model.InitOptionMap()
 
-	if err := model.InitLogDB(); err != nil {
-		return fmt.Errorf("failed to initialize log database: %w", err)
+	if model.LOG_DB == nil {
+		if err := model.InitLogDB(); err != nil {
+			return fmt.Errorf("failed to initialize log database: %w", err)
+		}
 	}
 	if err := common.InitRedisClient(); err != nil {
 		return fmt.Errorf("failed to initialize redis: %w", err)
@@ -313,9 +387,9 @@ func validateServerlessConfig() error {
 				"SQLite in a local file, which cannot work in a function runtime: the deployment " +
 				"bundle is mounted read-only, and /tmp is per-instance and discarded when the " +
 				"instance is recycled, so each concurrent instance would see a different empty " +
-				"database and all data would be lost. Provision a hosted database, run migrations " +
-				"against it once (a normal container with NODE_TYPE=master does this on boot), then " +
-				"set SQL_DSN here",
+				"database and all data would be lost. Provision a hosted database, set SQL_DSN to " +
+				"its connection string, then create the schema by calling the cron endpoint with " +
+				"?job=migrate",
 		)
 	}
 	return nil
