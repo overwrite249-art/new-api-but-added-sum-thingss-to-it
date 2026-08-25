@@ -21,10 +21,16 @@
 //   - never listens on a port and never waits on a signal;
 //   - does not embed or serve web/dist.
 //
-// REQUIRED CONFIGURATION (enforced below, not merely documented)
-// -------------------------------------------------------------
-//   - NODE_TYPE must NOT be "master".
-//     This is the single most important setting, and it is load-bearing twice:
+// CONFIGURATION
+// -------------
+// Settings that this runtime can determine for itself are forced or derived in
+// applyServerlessDefaults rather than demanded from the operator. That is not a
+// convenience: refusing to boot until a human sets them means EVERY request
+// answers 500, including the /api/setup call that the first-run setup wizard
+// needs, so the admin UI shows an error per panel and can never be configured.
+//
+//   - NODE_TYPE is FORCED to "slave". It is not a meaningful choice here, and
+//     it is load-bearing twice:
 //       1. StartSystemTaskRunner, StartSubscriptionQuotaResetTask and
 //          StartCodexCredentialAutoRefreshTask each begin with
 //          `if !common.IsMasterNode { return }`. Running as a slave means the
@@ -35,7 +41,11 @@
 //          FRONTEND_BASE_URL is empty. Slave + FRONTEND_BASE_URL set means the
 //          embedded filesystem is never touched, so we can pass a zero-valued
 //          WebAssets without tripping common.EmbedFolder.
-//   - FRONTEND_BASE_URL must be set (see above).
+//   - FRONTEND_BASE_URL is derived from the platform's own hostname when unset.
+//     An explicit value always wins, which matters behind a custom domain.
+//
+// SQL_DSN is the one setting that cannot be guessed; see
+// validateServerlessConfig for why the SQLite fallback cannot work here.
 //
 // DATABASE MIGRATIONS ARE NOT RUN HERE
 // ------------------------------------
@@ -147,6 +157,10 @@ func initResources() error {
 	// files rather than erroring, so the admin log viewer degrades cleanly.
 	*common.LogDir = ""
 
+	// Also MUST happen before InitEnv(), which is where common.IsMasterNode is
+	// derived from NODE_TYPE.
+	applyServerlessDefaults()
+
 	// Note: no godotenv.Load here. A function runtime injects configuration as
 	// real environment variables and the deployment bundle has no .env file.
 	common.InitEnv()
@@ -238,27 +252,70 @@ func initResources() error {
 	return nil
 }
 
-// validateServerlessConfig fails fast and loudly on the two settings that would
-// otherwise cause confusing downstream breakage: a master node would start
-// daemon loops that get frozen mid-work, and an empty FRONTEND_BASE_URL would
-// send SetRouter into SetWebRouter, which dereferences the embedded web/dist
-// filesystem that this build does not contain.
+// applyServerlessDefaults fills in configuration that this runtime can work out
+// for itself. Anything set explicitly by the operator wins.
+//
+// Caller must invoke this BEFORE common.InitEnv(), which reads NODE_TYPE.
+func applyServerlessDefaults() {
+	// Not "default to slave" -- FORCE slave. A master node here is always a
+	// misconfiguration: it would start daemon goroutines that the platform
+	// freezes mid-work, and it would send router.SetRouter into SetWebRouter,
+	// which reads a web/dist embed that this build does not contain. See the
+	// package comment.
+	_ = os.Setenv("NODE_TYPE", "slave")
+
+	if strings.TrimSpace(os.Getenv("FRONTEND_BASE_URL")) != "" {
+		return
+	}
+
+	// VERCEL_PROJECT_PRODUCTION_URL is the project's canonical production
+	// hostname and is populated even on preview deployments, so links baked into
+	// e-mails and OAuth redirects keep pointing somewhere durable. VERCEL_URL is
+	// the per-deployment hostname and is the fallback when no production alias
+	// exists yet. Neither includes a scheme.
+	for _, key := range []string{"VERCEL_PROJECT_PRODUCTION_URL", "VERCEL_URL"} {
+		if host := strings.TrimSpace(os.Getenv(key)); host != "" {
+			_ = os.Setenv("FRONTEND_BASE_URL", "https://"+host)
+			common.SysLog("serverless: derived FRONTEND_BASE_URL from " + key)
+			return
+		}
+	}
+}
+
+// validateServerlessConfig fails fast, with an explanation, on configuration
+// that would otherwise break confusingly further downstream.
+//
+// The NODE_TYPE and FRONTEND_BASE_URL checks are assertions rather than
+// requirements: applyServerlessDefaults has already handled both, so they
+// should be unreachable. They stay so that a future change to the default logic
+// fails here, saying why, instead of panicking inside router.SetRouter.
 func validateServerlessConfig() error {
 	if common.IsMasterNode {
 		return fmt.Errorf(
-			"serverless: NODE_TYPE must not be 'master' (got %q). " +
-				"A master node starts background goroutines that a function runtime freezes mid-work, " +
-				"and makes router.SetRouter serve the embedded frontend, which is not bundled here. " +
-				"Set NODE_TYPE=slave and drive periodic work with cron instead",
+			"serverless: NODE_TYPE resolved to master (env %q) despite being forced to slave. "+
+				"A master node starts background goroutines that a function runtime freezes mid-work, "+
+				"and makes router.SetRouter serve the embedded frontend, which is not bundled here",
 			os.Getenv("NODE_TYPE"),
 		)
 	}
 	if strings.TrimSpace(os.Getenv("FRONTEND_BASE_URL")) == "" {
 		return fmt.Errorf(
-			"serverless: FRONTEND_BASE_URL must be set. " +
-				"When it is empty, router.SetRouter calls SetWebRouter, which reads the embedded " +
-				"web/dist filesystem that this build intentionally omits (the frontend is served as " +
-				"static files by the platform). Set it to your canonical site URL",
+			"serverless: FRONTEND_BASE_URL is empty and could not be derived from the platform " +
+				"(VERCEL_PROJECT_PRODUCTION_URL and VERCEL_URL were both unset). While it is empty, " +
+				"router.SetRouter calls SetWebRouter, which reads the embedded web/dist filesystem " +
+				"that this build intentionally omits. Set FRONTEND_BASE_URL to your site URL",
+		)
+	}
+	if strings.TrimSpace(os.Getenv("SQL_DSN")) == "" {
+		return fmt.Errorf(
+			"serverless: SQL_DSN must be set to a MySQL or PostgreSQL connection string. " +
+				"This is the one setting that cannot be defaulted. Without it New API falls back to " +
+				"SQLite in a local file, which cannot work in a function runtime: the deployment " +
+				"bundle is mounted read-only, and /tmp is per-instance and discarded when the " +
+				"instance is recycled, so each concurrent instance would see a different empty " +
+				"database and all data would be lost. Provision a hosted database, run migrations " +
+				"against it once (a normal container with NODE_TYPE=master does this on boot), then " +
+				"set SQL_DSN here",
 		)
 	}
 	return nil
@@ -294,7 +351,7 @@ func buildEngine() (*gin.Engine, error) {
 	server.Use(middleware.I18n())
 	middleware.SetUpLogger(server)
 
-	// A zero-valued WebAssets is safe here ONLY because validateServerlessConfig
+	// A zero-valued WebAssets is safe here ONLY because applyServerlessDefaults
 	// guarantees slave + non-empty FRONTEND_BASE_URL, which makes SetRouter take
 	// its redirect branch and never call SetWebRouter.
 	router.SetRouter(server, router.WebAssets{})
