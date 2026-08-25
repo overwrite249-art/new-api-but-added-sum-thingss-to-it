@@ -1,8 +1,9 @@
 # Security audit — pass 1
 
 **Scope of this pass:** `middleware/` (auth, rate limiting, client IP, CORS,
-Turnstile, security proofs), `router/relay-router.go`, and the deployment model
-of the serverless port.
+Turnstile, security proofs, cookie origin guard), `router/relay-router.go`,
+`router/api-router.go`, the session/secret handling in `common/init.go` and
+`common/session_cookie.go`, and the deployment model of the serverless port.
 
 **Not reviewed:** `service/` (~78 files), `controller/` (~88 files), all of
 `relay/` except `mjproxy_handler.go`, `model/`, `oauth/`, `pkg/billingexpr`, and
@@ -18,12 +19,19 @@ Severity is judged for a **publicly reachable** deployment.
 |---|---|---|---|
 | S-1 | High | `TRUSTED_PROXIES=0.0.0.0/0` made `c.ClientIP()` forgeable | **Fixed** (was introduced by this port) |
 | S-2 | High | Without Redis, no rate limiting works on serverless | **Documented**, needs config |
+| S-9 | High | No `SESSION_SECRET` requirement, so sessions and HMACs failed across instances | **Fixed** (was a defect of this port) |
 | S-3 | Medium | `/mj/image/:id` is unauthenticated and not user-scoped | Upstream, unchanged |
 | S-4 | Medium | Model rate limiter behaves differently on Redis vs memory | Upstream, unchanged |
+| S-10 | Medium | Secure-cookie default disabled the auth-endpoint CSRF guard | **Fixed** (inherited default, wrong here) |
 | S-5 | Low | Wildcard CORS is advertised with credentials enabled | Upstream, note only |
 | S-6 | Info | API keys accepted in the query string | Upstream, by design |
 | S-7 | Info | `TokenAuthReadOnly` accepts expired/exhausted tokens | Upstream, by design |
 | S-8 | Info | `WssAuth` is an empty unused middleware | Upstream, dead code |
+
+Three of the ten findings (S-1, S-9, S-10) are the serverless port's own doing,
+not upstream's. That ratio is the main lesson of this pass: **configuration
+written to make a deployment work is part of its attack surface**, and it has to
+be reviewed with the same suspicion as code.
 
 ---
 
@@ -263,7 +271,8 @@ their own usage logs. Only `common.TokenStatusDisabled` is rejected, and banned
 users are still blocked.
 
 Deliberate, and reasonable for read-only usage views. Flagged so nobody mounts
-it on anything that is not read-only.
+it on anything that is not read-only. Currently mounted on
+`/api/usage/token` and `/api/log/token` only.
 
 ---
 
@@ -283,6 +292,138 @@ It is a trap, though: the name implies it authenticates WebSocket upgrades, and
 mounting it would silently authenticate nothing. `/v1/realtime` is in fact
 protected, because `relayV1Router.Use(middleware.TokenAuth())` covers the
 `wsRouter` subgroup. Deleting `WssAuth` would be an improvement.
+
+---
+
+## S-9 — High — Sessions and HMACs failed across instances without `SESSION_SECRET`
+
+**Another defect of this port**, and a worse one than S-1 in the sense that it
+fails *silently and intermittently* rather than being exploitable on demand.
+
+`validateServerlessConfig` refused to serve without `SQL_DSN` but said nothing
+about `SESSION_SECRET`. Upstream's fallback is in `common/constants.go`:
+
+```go
+var SessionSecret = uuid.New().String()
+var CryptoSecret  = uuid.New().String()
+```
+
+A package-level initialiser, so it is evaluated **once per process**. And in
+`common/init.go`, `SESSION_SECRET` is only consulted when non-empty:
+
+```go
+if os.Getenv("SESSION_SECRET") != "" { /* ... */ SessionSecret = ss }
+if os.Getenv("CRYPTO_SECRET") != "" {
+    CryptoSecret = os.Getenv("CRYPTO_SECRET")
+} else {
+    CryptoSecret = SessionSecret
+}
+```
+
+Note that `InitEnv` rejects the literal placeholder `random_string` with
+`log.Fatal`, but accepts the variable being absent entirely.
+
+### Why the deployment model changes the severity
+
+For a daemon this is a minor annoyance: one process, one secret, and a restart
+signs everybody out. A function runtime serves requests from many concurrent
+instances, each of which ran that initialiser separately, so there is no shared
+key at all. Consequences:
+
+- **Sessions and access tokens issued by one instance are rejected by the next.**
+  The user sees random logouts and login loops. Nothing is logged, because from
+  each instance's point of view it simply received an invalid credential.
+- **`CryptoSecret` inherits the same divergence**, and `common/crypto.go` keys
+  HMAC-SHA256 with it:
+
+  ```go
+  func GenerateHMAC(data string) string {
+      h := hmac.New(sha256.New, []byte(CryptoSecret))
+      ...
+  }
+  ```
+
+  So an HMAC produced on one instance does not verify on another.
+
+The reason this is rated High is the diagnosis cost. There is no error message
+to search for, the failure rate scales with how many instances are warm, and it
+looks exactly like an application session bug.
+
+**Scope note:** only `GenerateHMAC` was verified as a consumer of
+`CryptoSecret`. HMAC is authentication, not encryption, so this is a
+verification-failure problem — **not** a claim that stored ciphertext becomes
+undecryptable. Whether anything encrypts at rest with this key was not checked.
+
+### Fix
+
+`SESSION_SECRET` is now required by `validateServerlessConfig`, alongside
+`SQL_DSN`, with an error that explains the per-process fallback. A missing value
+now produces a JSON 500 naming the variable instead of behaving erratically.
+
+---
+
+## S-10 — Medium — The secure-cookie default disabled the auth CSRF guard
+
+Inherited from upstream rather than written here, but wrong for this deployment
+model and therefore this port's responsibility.
+
+`common.SessionCookieSecure` defaults to `false`. That reads like a cookie
+attribute, but `middleware/auth_origin.go` turns the whole guard off with it:
+
+```go
+func SessionCookieOriginGuard() gin.HandlerFunc {
+    return func(c *gin.Context) {
+        if !common.SessionCookieSecure {
+            c.Next()
+            return
+        }
+        origin, ok := requestBrowserOrigin(c.Request)
+        if !ok || !isAllowedSessionOrigin(c.Request, origin) {
+            /* 403 AUTH_ORIGIN_FORBIDDEN */
+        }
+```
+
+Its own comment is explicit that this is intentional: *"In insecure local
+development mode it preserves the legacy behavior and intentionally performs no
+Origin validation."* Reasonable for `http://localhost`. Not reasonable for a
+public HTTPS deployment, which is the only kind this platform produces.
+
+The guard is mounted in `router/api-router.go` on exactly two routes:
+
+```go
+userRoute.POST("/auth/refresh", middleware.SessionCookieOriginGuard(), ...)
+userRoute.POST("/auth/logout",  middleware.SessionCookieOriginGuard(), ...)
+```
+
+Both are cookie-authenticated, so with the default they were the classic CSRF
+shape: a cross-site page could force a token refresh or a logout using the
+victim's ambient cookie. Impact is bounded — neither endpoint moves money or
+changes credentials — which is why this is Medium and not High.
+
+### Fix, and the trap in it
+
+`applySessionCookieDefaults` now sets `SESSION_COOKIE_SECURE=true` before
+`common.InitEnv()` runs. The obvious one-line version of that fix **bricks every
+cold start**, because `common/session_cookie.go` enforces a pairing:
+
+```go
+if trustedURLsRaw == "" {
+    return fmt.Errorf("SESSION_COOKIE_SECURE=true requires SESSION_COOKIE_TRUSTED_URL")
+}
+```
+
+and `InitEnv` handles that error with `log.Fatal`, i.e. `os.Exit(1)` before any
+handler can reply — the same opaque `FUNCTION_INVOCATION_FAILED` class of
+failure as the read-only `logs` directory crash. So the default is applied only
+when an https origin can be derived from the resolved `FRONTEND_BASE_URL` to
+pair with it, an explicit `SESSION_COOKIE_SECURE=false` is still honoured, and
+an operator who sets the flag themselves without a trusted URL gets the derived
+origin filled in rather than a dead deployment.
+
+Trusted origins must be https and scheme+host only; `common.NormalizeOrigin`
+rejects paths, queries, credentials and wildcards, and `isAllowedSessionOrigin`
+compares with `crypto/subtle.ConstantTimeCompare` against both the request's own
+origin and the configured list.
 
 ---
 
@@ -310,6 +451,8 @@ In descending expected value:
 1. `controller/user.go` (~42 KB) — registration, login, password reset, e-mail
    binding, session lifecycle.
 2. `oauth/` — OAuth `state` handling and CSRF protection on account binding.
+   Note that `/api/oauth/:provider` is a GET with `TryUserAuth`, so the binding
+   flow is reachable while authenticated; `state` is the only defence.
 3. `service/authz/` and `RequirePermission` — whether every admin route is
    actually gated, and whether `RequirePermission` is reachable without
    `authHelper` having run (it reads `c.GetInt("role")`, which defaults to 0).
@@ -318,3 +461,8 @@ In descending expected value:
 5. `relay/channel/*` — per-provider adaptors handling untrusted upstream
    responses.
 6. Token generation and password hashing — confirm `crypto/rand` throughout.
+7. The unauthenticated payment webhooks in `router/api-router.go`
+   (`/api/stripe/webhook`, `/api/creem/webhook`, `/api/waffo/webhook`,
+   `/api/waffo-pancake/webhook/:env`, `/api/user/epay/notify`,
+   `/api/subscription/epay/notify`) — signature verification is the only thing
+   standing between these and forged balance top-ups.
